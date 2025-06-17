@@ -1,0 +1,9 @@
+[package]
+name = "waytoy"
+version = "0.1.0"
+edition = "2024"
+authors = ["bbb651"]
+license = "GPL-3.0-only"
+
+[dependencies]
+rustix = { version = "1.0.7", features = ["event", "net"] }
