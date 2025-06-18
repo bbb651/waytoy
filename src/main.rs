@@ -1,4 +1,7 @@
+mod protocol;
+
 use std::{
+    cmp::Ordering,
     env,
     io::{IoSlice, IoSliceMut},
     mem::MaybeUninit,
@@ -7,6 +10,7 @@ use std::{
     process::Command,
 };
 
+use protocol::{Interface, Type, WAYLAND};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     io::retry_on_intr,
@@ -38,7 +42,8 @@ fn main() {
     .expect("failed to open unix socket");
 
     let socket_name = format!("waytoy-{}", std::process::id());
-    let client_socket_addr = SocketAddrUnix::new(runtime_dir.join(&socket_name)).expect("failed to bind client addr");
+    let client_socket_addr =
+        SocketAddrUnix::new(runtime_dir.join(&socket_name)).expect("failed to bind client addr");
     bind(&server_socket, &client_socket_addr).expect("failed to bind unix socket");
     listen(&server_socket, 128).expect("failed to set server socket to listen mode");
 
@@ -75,6 +80,9 @@ fn main() {
         Err(e) => panic!("unexpected error on connect() {}", e),
     };
 
+    let mut state = State {
+        objects: ObjectMap::new(),
+    };
     loop {
         let mut poll_fds = [
             PollFd::from_borrowed_fd(server.as_fd(), PollFlags::IN),
@@ -92,15 +100,15 @@ fn main() {
         poll_fds[1].clear_revents();
 
         if client_to_server {
-            transfer(&mut client, &mut server);
+            transfer(&mut state, MessageKind::Request, &mut client, &mut server);
         }
         if server_to_client {
-            transfer(&mut server, &mut client);
+            transfer(&mut state, MessageKind::Event, &mut server, &mut client);
         }
     }
 }
 
-fn transfer(from: &mut OwnedFd, to: &mut OwnedFd) {
+fn transfer(state: &mut State, kind: MessageKind, from: &mut OwnedFd, to: &mut OwnedFd) {
     let mut bytes = [0u8; 4096];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(253))];
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -138,21 +146,200 @@ fn transfer(from: &mut OwnedFd, to: &mut OwnedFd) {
     let to_send: Vec<_> = fds.iter().map(|fd| fd.as_fd()).collect();
     send_cmsg.push(SendAncillaryMessage::ScmRights(to_send.as_slice()));
 
-    while bytes.len() > 0 {
-        match sendmsg(
-            to.as_fd(),
-            &[IoSlice::new(&bytes)],
-            &mut send_cmsg,
-            SendFlags::empty(),
-        ) {
-            Ok(0) => {
-                std::process::exit(0);
+    while let Some(length) = parse_message(state, &bytes[..], kind) {
+        let (mut to_send, rest) = bytes.split_at(length);
+        while to_send.len() > 0 {
+            match sendmsg(
+                to.as_fd(),
+                &[IoSlice::new(&to_send)],
+                &mut send_cmsg,
+                SendFlags::empty(),
+            ) {
+                Ok(0) => {
+                    std::process::exit(0);
+                }
+                Ok(sent) => {
+                    to_send = &to_send[sent..];
+                    send_cmsg.clear();
+                }
+                Err(e) => panic!("sendmsg error: {e}"),
             }
-            Ok(sent) => {
-                bytes = &bytes[sent..];
-                send_cmsg.clear();
+        }
+        bytes = rest;
+    }
+}
+
+fn parse_message(state: &mut State, bytes: &[u8], kind: MessageKind) -> Option<usize> {
+    if bytes.len() < 2 * 4 {
+        return None;
+    }
+    let id = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let (opcode, length) = {
+        let word = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        ((word & 0xffff) as u16, (word >> 16) as u16)
+    };
+    dbg!(id, opcode);
+    let message = state
+        .objects
+        .find(id)
+        .and_then(|o| {
+            let interface = o.interface.known();
+            match kind {
+                MessageKind::Request => interface.requests.get(opcode as usize),
+                MessageKind::Event => interface.events.get(opcode as usize),
             }
-            Err(e) => panic!("sendmsg error: {e}"),
+        })
+        .expect("invalid message");
+    dbg!(&message.name);
+    dbg!(&bytes[8..length as usize]);
+    for arg in message.args.iter() {
+        if arg.typ == Type::NewId {
+            let object = Object {
+                interface: InterfaceRef::Unknown(
+                    arg.interface.clone().expect("missing interface for new_id"),
+                ),
+            };
+            match kind {
+                MessageKind::Request => state.objects.client_insert_new(object),
+                MessageKind::Event => state.objects.server_insert_new(object),
+            };
+        }
+    }
+    Some(length as usize)
+}
+
+struct State {
+    objects: ObjectMap,
+}
+
+#[derive(Debug, Clone)]
+pub struct Object {
+    interface: InterfaceRef,
+}
+
+#[derive(Debug, Clone)]
+pub enum InterfaceRef {
+    Known(&'static Interface),
+    Unknown(String),
+}
+
+impl InterfaceRef {
+    pub fn name(&self) -> &str {
+        match self {
+            InterfaceRef::Known(interface) => &interface.name,
+            InterfaceRef::Unknown(name) => name,
+        }
+    }
+
+    pub fn known(&self) -> &'static Interface {
+        match self {
+            InterfaceRef::Known(interface) => interface,
+            InterfaceRef::Unknown(name) => {
+                panic!("expected known interface, found unknown interface `{name}`")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MessageKind {
+    Request,
+    Event,
+}
+
+const SERVER_ID_LIMIT: u32 = 0xFF00_0000;
+
+#[derive(Debug, Default)]
+pub struct ObjectMap {
+    client_objects: Vec<Option<Object>>,
+    server_objects: Vec<Option<Object>>,
+}
+
+impl ObjectMap {
+    pub fn new() -> Self {
+        ObjectMap {
+            client_objects: vec![Some(Object {
+                interface: InterfaceRef::Known(&WAYLAND.interfaces[0]),
+            })],
+            server_objects: vec![],
+        }
+    }
+
+    pub fn find(&self, id: u32) -> Option<Object> {
+        if id == 0 {
+            None
+        } else if id >= SERVER_ID_LIMIT {
+            self.server_objects
+                .get((id - SERVER_ID_LIMIT) as usize)
+                .and_then(Clone::clone)
+        } else {
+            self.client_objects
+                .get((id - 1) as usize)
+                .and_then(Clone::clone)
+        }
+    }
+
+    pub fn remove(&mut self, id: u32) {
+        if id == 0 {
+        } else if id >= SERVER_ID_LIMIT {
+            if let Some(place) = self.server_objects.get_mut((id - SERVER_ID_LIMIT) as usize) {
+                *place = None;
+            }
+        } else if let Some(place) = self.client_objects.get_mut((id - 1) as usize) {
+            *place = None;
+        }
+    }
+
+    pub fn insert_at(&mut self, id: u32, object: Object) -> Result<(), ()> {
+        if id == 0 {
+            Err(())
+        } else if id >= SERVER_ID_LIMIT {
+            insert_in_at(
+                &mut self.server_objects,
+                (id - SERVER_ID_LIMIT) as usize,
+                object,
+            )
+        } else {
+            insert_in_at(&mut self.client_objects, (id - 1) as usize, object)
+        }
+    }
+
+    pub fn client_insert_new(&mut self, object: Object) -> u32 {
+        insert_in(&mut self.client_objects, object) + 1
+    }
+
+    pub fn server_insert_new(&mut self, object: Object) -> u32 {
+        insert_in(&mut self.server_objects, object) + SERVER_ID_LIMIT
+    }
+}
+
+fn insert_in(store: &mut Vec<Option<Object>>, object: Object) -> u32 {
+    match store.iter().position(Option::is_none) {
+        Some(id) => {
+            store[id] = Some(object);
+            id as u32
+        }
+        None => {
+            store.push(Some(object));
+            (store.len() - 1) as u32
+        }
+    }
+}
+
+fn insert_in_at(store: &mut Vec<Option<Object>>, id: usize, object: Object) -> Result<(), ()> {
+    match id.cmp(&store.len()) {
+        Ordering::Greater => Err(()),
+        Ordering::Equal => {
+            store.push(Some(object));
+            Ok(())
+        }
+        Ordering::Less => {
+            let previous = &mut store[id];
+            if !previous.is_none() {
+                return Err(());
+            }
+            *previous = Some(object);
+            Ok(())
         }
     }
 }
