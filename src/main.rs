@@ -5,7 +5,10 @@ use std::{
     env,
     io::{IoSlice, IoSliceMut},
     mem::MaybeUninit,
-    os::fd::{AsFd, OwnedFd},
+    os::{
+        fd::{AsFd, BorrowedFd, OwnedFd},
+        unix::net::{UnixListener, UnixStream},
+    },
     path::Path,
     process::Command,
 };
@@ -15,9 +18,8 @@ use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     io::retry_on_intr,
     net::{
-        AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-        SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType, accept_with,
-        bind, connect, listen, recvmsg, sendmsg, socket_with,
+        RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
+        SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
     },
 };
 
@@ -31,21 +33,10 @@ fn main() {
     let runtime_dir = env::var("XDG_RUNTIME_DIR").expect("`XDG_RUNTIME_DIR` should be set");
     let runtime_dir = Path::new(&runtime_dir);
 
-    let socket_path = runtime_dir.join(&wayland_display);
-    let server_socket_addr = SocketAddrUnix::new(&socket_path).expect("failed to bind server addr");
-    let server_socket = socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-        None,
-    )
-    .expect("failed to open unix socket");
-
     let socket_name = format!("waytoy-{}", std::process::id());
-    let client_socket_addr =
-        SocketAddrUnix::new(runtime_dir.join(&socket_name)).expect("failed to bind client addr");
-    bind(&server_socket, &client_socket_addr).expect("failed to bind unix socket");
-    listen(&server_socket, 128).expect("failed to set server socket to listen mode");
+    let server_socket_path = runtime_dir.join(&socket_name);
+    let server_socket =
+        UnixListener::bind(&server_socket_path).expect("failed to bind unix socket");
 
     let mut args = env::args();
     let _ = args.find(|arg| arg == "--");
@@ -64,21 +55,12 @@ fn main() {
         Ok(_) => {}
         Err(e) => panic!("poll error: {e}"),
     }
-    let mut client = match accept_with(&server_socket, SocketFlags::CLOEXEC) {
+    let (client, _) = match server_socket.accept() {
         Ok(client) => client,
         Err(e) => panic!("accept error: {e}"),
     };
-    let mut server = socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-    )
-    .expect("failed to open unix socket");
-    match connect(&server, &server_socket_addr) {
-        Ok(_) => {}
-        Err(e) => panic!("unexpected error on connect() {}", e),
-    };
+    let socket_path = runtime_dir.join(&wayland_display);
+    let server = UnixStream::connect(socket_path).expect("failed to open unix socket");
 
     let mut state = State {
         objects: ObjectMap::new(),
@@ -100,15 +82,25 @@ fn main() {
         poll_fds[1].clear_revents();
 
         if client_to_server {
-            transfer(&mut state, MessageKind::Request, &mut client, &mut server);
+            transfer(
+                &mut state,
+                MessageKind::Request,
+                client.as_fd(),
+                server.as_fd(),
+            );
         }
         if server_to_client {
-            transfer(&mut state, MessageKind::Event, &mut server, &mut client);
+            transfer(
+                &mut state,
+                MessageKind::Event,
+                server.as_fd(),
+                client.as_fd(),
+            );
         }
     }
 }
 
-fn transfer(state: &mut State, kind: MessageKind, from: &mut OwnedFd, to: &mut OwnedFd) {
+fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: BorrowedFd) {
     let mut bytes = [0u8; 4096];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(253))];
     let mut fds: Vec<OwnedFd> = Vec::new();
