@@ -10,7 +10,7 @@ use std::{
     process::Command,
 };
 
-use protocol::{Interface, Type, WAYLAND};
+use protocol::{INTERFACE_TO_PROTOCOL, Interface, PROTOCOLS, Type};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     io::retry_on_intr,
@@ -169,7 +169,7 @@ fn transfer(state: &mut State, kind: MessageKind, from: &mut OwnedFd, to: &mut O
     }
 }
 
-fn parse_message(state: &mut State, bytes: &[u8], kind: MessageKind) -> Option<usize> {
+fn parse_message(state: &mut State, mut bytes: &[u8], kind: MessageKind) -> Option<usize> {
     if bytes.len() < 2 * 4 {
         return None;
     }
@@ -178,32 +178,96 @@ fn parse_message(state: &mut State, bytes: &[u8], kind: MessageKind) -> Option<u
         let word = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         ((word & 0xffff) as u16, (word >> 16) as u16)
     };
-    dbg!(id, opcode);
+    // dbg!(id, opcode);
     let message = state
         .objects
-        .find(id)
+        .find(dbg!(id))
         .and_then(|o| {
             let interface = o.interface.known();
+            // dbg!(opcode);
+            // dbg!(interface);
             match kind {
                 MessageKind::Request => interface.requests.get(opcode as usize),
                 MessageKind::Event => interface.events.get(opcode as usize),
             }
         })
         .expect("invalid message");
-    dbg!(&message.name);
-    dbg!(&bytes[8..length as usize]);
+    // dbg!(&message.name);
+    bytes = &bytes[8..length as usize];
+    let mut offset = 0;
     for arg in message.args.iter() {
-        if arg.typ == Type::NewId {
-            let object = Object {
-                interface: InterfaceRef::Unknown(
-                    arg.interface.clone().expect("missing interface for new_id"),
-                ),
-            };
-            match kind {
-                MessageKind::Request => state.objects.client_insert_new(object),
-                MessageKind::Event => state.objects.server_insert_new(object),
-            };
-        }
+        // dbg!(arg);
+        offset += match arg.typ {
+            Type::Int => 4,
+            Type::Uint => 4,
+            Type::Fixed => 4,
+            Type::String => {
+                4 + u32::from_ne_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]) as usize
+            }
+            Type::Object => 4,
+            Type::NewId => {
+                let mut len = 0;
+                // dbg!(offset);
+                let interface = arg.interface.clone().unwrap_or_else(|| {
+                    // dbg!(&bytes);
+                    let name_len = u32::from_ne_bytes([
+                        bytes[offset],
+                        bytes[offset + 1],
+                        bytes[offset + 2],
+                        bytes[offset + 3],
+                    ]);
+                    // dbg!(name_len);
+                    let _version = u32::from_ne_bytes([
+                        bytes[offset + 4 + name_len as usize],
+                        bytes[offset + 4 + name_len as usize + 1],
+                        bytes[offset + 4 + name_len as usize + 2],
+                        bytes[offset + 4 + name_len as usize + 3],
+                    ]);
+                    len += u32::div_ceil(name_len, 4) * 4 + 8;
+                    String::from_utf8(Vec::from(
+                        &bytes[offset + 4..offset + 4 + name_len as usize - 1],
+                    ))
+                    .expect("interface names must be valid utf-8")
+                });
+                let protocol = &PROTOCOLS[&INTERFACE_TO_PROTOCOL[dbg!(&interface)]];
+                let object = Object {
+                    interface: InterfaceRef::Known(
+                        protocol
+                            .interfaces
+                            .iter()
+                            .find(|Interface { name, .. }| name == &interface)
+                            .expect("missing protocol"),
+                    ),
+                };
+                let object_id = u32::from_ne_bytes([
+                    bytes[offset + len as usize],
+                    bytes[offset + len as usize + 1],
+                    bytes[offset + len as usize + 2],
+                    bytes[offset + len as usize + 3],
+                ]);
+                dbg!(object_id);
+                len += 4;
+                match kind {
+                    MessageKind::Request => state.objects.insert_at(object_id, object),
+                    MessageKind::Event => state.objects.insert_at(object_id, object),
+                };
+                len as usize
+            }
+            Type::Array => {
+                4 + u32::from_ne_bytes([
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                ]) as usize
+            }
+            Type::Fd => 0,
+        };
     }
     Some(length as usize)
 }
@@ -259,7 +323,7 @@ impl ObjectMap {
     pub fn new() -> Self {
         ObjectMap {
             client_objects: vec![Some(Object {
-                interface: InterfaceRef::Known(&WAYLAND.interfaces[0]),
+                interface: InterfaceRef::Known(&PROTOCOLS["wayland"].interfaces[0]),
             })],
             server_objects: vec![],
         }
