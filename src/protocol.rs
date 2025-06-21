@@ -148,7 +148,12 @@ pub static PROTOCOLS: LazyLock<HashMap<String, Protocol>> = LazyLock::new(|| {
 });
 
 pub static INTERFACE_TO_PROTOCOL: LazyLock<HashMap<String, String>> = LazyLock::new(|| {
-    PROTOCOLS.iter().flat_map(|(name, Protocol { interfaces, .. })| {
-        interfaces.iter().map(|interface| (interface.name.clone(), name.clone()))
-    }).collect()
+    PROTOCOLS
+        .iter()
+        .flat_map(|(name, Protocol { interfaces, .. })| {
+            interfaces
+                .iter()
+                .map(|interface| (interface.name.clone(), name.clone()))
+        })
+        .collect()
 });

@@ -13,7 +13,7 @@ use std::{
     process::Command,
 };
 
-use protocol::{INTERFACE_TO_PROTOCOL, Interface, PROTOCOLS, Type};
+use protocol::{INTERFACE_TO_PROTOCOL, Interface, Message, PROTOCOLS, Type};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
     io::retry_on_intr,
@@ -21,6 +21,10 @@ use rustix::{
         RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
         SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
     },
+};
+use tinywasm::{
+    Extern, FuncContext, Imports, MemoryStringExt, Module, Store,
+    types::{FuncType, ValType, WasmValue},
 };
 
 const CLIENT_TIMEOUT: Timespec = Timespec {
@@ -38,8 +42,143 @@ fn main() {
     let server_socket =
         UnixListener::bind(&server_socket_path).expect("failed to bind unix socket");
 
-    let mut args = env::args();
+    let mut args = env::args().skip(1);
+    let program = args.next().expect("missing program");
     let _ = args.find(|arg| arg == "--");
+
+    let mut store = Store::new();
+    let mut module = Module::parse_file(program).expect("failed to parse wasm module");
+    let mut imports = Imports::new();
+    for (_, protocol) in PROTOCOLS.iter() {
+        for interface in protocol.interfaces.iter() {
+            for message in interface.requests.iter().chain(interface.events.iter()) {
+                let arg_types = message
+                    .args
+                    .iter()
+                    .flat_map(|arg| match arg.typ {
+                        Type::Int => [ValType::I32].as_slice(),
+                        Type::Uint => [ValType::I64].as_slice(),
+                        Type::Fixed => [ValType::I32].as_slice(),
+                        Type::String => [ValType::I32, ValType::I32].as_slice(),
+                        Type::Object => [ValType::I32].as_slice(),
+                        Type::NewId => [ValType::I32].as_slice(),
+                        Type::Array => [ValType::I32, ValType::I32].as_slice(),
+                        Type::Fd => [ValType::I32].as_slice(),
+                    })
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let name = format!("{}_{}", interface.name, message.name);
+                imports
+                    .define(
+                        "wayland",
+                        &name,
+                        Extern::func(
+                            &FuncType {
+                                params: arg_types,
+                                results: Box::new([]),
+                            },
+                            move |mut ctx: FuncContext<'_>, args| {
+                                #[derive(Debug)]
+                                pub enum Arg {
+                                    Int(i32),
+                                    Uint(u32),
+                                    Fixed(f64),
+                                    String(String),
+                                    Object(u32),
+                                    NewId(u32),
+                                    Array(Vec<u8>),
+                                    Fd(i32),
+                                }
+                                let mut args = args.into_iter();
+                                let args = message
+                                    .args
+                                    .iter()
+                                    .map(|arg| match arg.typ {
+                                        Type::Int => {
+                                            let WasmValue::I32(int) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            Arg::Int(*int)
+                                        }
+                                        Type::Uint => {
+                                            let WasmValue::I64(uint) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            Arg::Uint(*uint as u32)
+                                        }
+                                        Type::Fixed => {
+                                            let WasmValue::I32(fixed) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            Arg::Fixed(*fixed as f64 / 256.0)
+                                        }
+                                        Type::String => {
+                                            let WasmValue::I32(len) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            let WasmValue::I32(ptr) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            let mem = ctx.exported_memory("memory").unwrap();
+                                            let string = mem
+                                                .load_string(*ptr as usize, *len as usize)
+                                                .unwrap();
+                                            Arg::String(string)
+                                        }
+                                        Type::Object => {
+                                            let WasmValue::I32(object) = args.next().unwrap()
+                                            else {
+                                                unreachable!()
+                                            };
+                                            Arg::Object(*object as u32)
+                                        }
+                                        Type::NewId => {
+                                            let WasmValue::I32(new_id) = args.next().unwrap()
+                                            else {
+                                                unreachable!()
+                                            };
+                                            Arg::Object(*new_id as u32)
+                                        }
+                                        Type::Array => {
+                                            let WasmValue::I32(len) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            let WasmValue::I32(ptr) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            let mem = ctx.exported_memory("memory").unwrap();
+                                            let bytes =
+                                                mem.load_vec(*ptr as usize, *len as usize).unwrap();
+                                            Arg::Array(bytes)
+                                        }
+                                        Type::Fd => {
+                                            let WasmValue::I32(fd) = args.next().unwrap() else {
+                                                unreachable!()
+                                            };
+                                            Arg::Int(*fd)
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                dbg!(args);
+                                Ok(Vec::new())
+                            },
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    let mut instance = module
+        .instantiate(&mut store, Some(imports))
+        .expect("failed to instantiate wasm module");
+    let mut memory = instance.exported_memory_mut(&mut store, "memory").unwrap();
+    memory.store(20000, 4, b"TEST").unwrap();
+    let mut callback = instance
+        .exported_func::<(i64, i32, i32, i64), ()>(&store, "wl_registry_global")
+        .unwrap();
+    let result = callback.call(&mut store, (1, 20000, 4, 2)).unwrap();
 
     Command::new(args.next().expect("missing client executable"))
         .args(args)
