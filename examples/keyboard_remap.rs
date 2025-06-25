@@ -12,6 +12,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 unsafe extern "C" {
     #[link_name = "wl_keyboard_modifiers"]
     fn wl_keyboard_modifiers(
+        wl_keyboard: u32,
         serial: u32,
         mods_depressed: u32,
         mods_latched: u32,
@@ -20,13 +21,14 @@ unsafe extern "C" {
     );
 
     #[link_name = "wl_keyboard_key"]
-    fn wl_keyboard_key(serial: u32, time: u32, key: u32, state: u32);
+    fn wl_keyboard_key(wl_keyboard: u32, serial: u32, time: u32, key: u32, state: u32);
 }
 
 static mut CTRL: bool = false;
 
 #[unsafe(export_name = "wl_keyboard_modifiers")]
 pub extern "C" fn _wl_keyboard_modifiers(
+    wl_keyboard: u32,
     serial: u32,
     mods_depressed: u32,
     mods_latched: u32,
@@ -35,14 +37,22 @@ pub extern "C" fn _wl_keyboard_modifiers(
 ) {
     unsafe {
         CTRL = (mods_depressed >> 2) & 1 != 0;
-        wl_keyboard_modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+        wl_keyboard_modifiers(
+            wl_keyboard,
+            serial,
+            mods_depressed,
+            mods_latched,
+            mods_locked,
+            group,
+        );
     }
 }
 
 #[unsafe(export_name = "wl_keyboard_key")]
-pub extern "C" fn _wl_keyboard_key(serial: u32, time: u32, key: u32, state: u32) {
+pub extern "C" fn _wl_keyboard_key(wl_keyboard: u32, serial: u32, time: u32, key: u32, state: u32) {
     unsafe {
         wl_keyboard_key(
+            wl_keyboard,
             serial,
             time,
             match key {

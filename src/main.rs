@@ -4,6 +4,7 @@ use std::{
     cmp::Ordering,
     env,
     io::{IoSlice, IoSliceMut},
+    iter,
     mem::MaybeUninit,
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
@@ -231,24 +232,39 @@ fn main() {
     let mut store = Store::new();
     let module = Module::parse_file(program).expect("failed to parse wasm module");
     let mut imports = Imports::new();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<Arg>>(1);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Message>(16);
     for (_, protocol) in PROTOCOLS.iter() {
         for interface in protocol.interfaces.iter() {
-            for message in interface.requests.iter().chain(interface.events.iter()) {
-                let arg_types = message
-                    .args
-                    .iter()
-                    .flat_map(|arg| match arg.ty {
-                        Type::Int => [ValType::I64].as_slice(),
-                        Type::Uint => [ValType::I32].as_slice(),
-                        Type::Fixed => [ValType::I32].as_slice(),
-                        Type::String => [ValType::I32, ValType::I32].as_slice(),
-                        Type::Object => [ValType::I32].as_slice(),
-                        Type::NewId => [ValType::I32].as_slice(),
-                        Type::Array => [ValType::I32, ValType::I32].as_slice(),
-                        Type::Fd => [ValType::I32].as_slice(),
-                    })
-                    .copied()
+            for (opcode, message, kind) in interface
+                .requests
+                .iter()
+                .enumerate()
+                .map(|(i, request)| (i as u16, request, MessageKind::Request))
+                .chain(
+                    interface
+                        .events
+                        .iter()
+                        .enumerate()
+                        .map(|(i, event)| (i as u16, event, MessageKind::Event)),
+                )
+            {
+                let arg_types = iter::once(ValType::I32)
+                    .chain(
+                        message
+                            .args
+                            .iter()
+                            .flat_map(|arg| match arg.ty {
+                                Type::Int => [ValType::I64].as_slice(),
+                                Type::Uint => [ValType::I32].as_slice(),
+                                Type::Fixed => [ValType::I32].as_slice(),
+                                Type::String => [ValType::I32, ValType::I32].as_slice(),
+                                Type::Object => [ValType::I32].as_slice(),
+                                Type::NewId => [ValType::I32].as_slice(),
+                                Type::Array => [ValType::I32, ValType::I32].as_slice(),
+                                Type::Fd => [ValType::I32].as_slice(),
+                            })
+                            .copied(),
+                    )
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
                 let name = format!("{}_{}", interface.name, message.name);
@@ -265,6 +281,12 @@ fn main() {
                                 let tx = tx.clone();
                                 move |mut ctx: FuncContext<'_>, args| {
                                     let mut args = args.into_iter().rev();
+                                    let object_id = {
+                                        let WasmValue::I32(int) = args.next().unwrap() else {
+                                            unreachable!()
+                                        };
+                                        *int as u32
+                                    };
                                     let args = message
                                         .args
                                         .iter()
@@ -291,11 +313,11 @@ fn main() {
                                                 Arg::Fixed(*fixed as f64 / 256.0)
                                             }
                                             Type::String => {
-                                                let WasmValue::I32(len) = args.next().unwrap()
+                                                let WasmValue::I32(ptr) = args.next().unwrap()
                                                 else {
                                                     unreachable!()
                                                 };
-                                                let WasmValue::I32(ptr) = args.next().unwrap()
+                                                let WasmValue::I32(len) = args.next().unwrap()
                                                 else {
                                                     unreachable!()
                                                 };
@@ -320,11 +342,11 @@ fn main() {
                                                 Arg::Object(*new_id as u32)
                                             }
                                             Type::Array => {
-                                                let WasmValue::I32(len) = args.next().unwrap()
+                                                let WasmValue::I32(ptr) = args.next().unwrap()
                                                 else {
                                                     unreachable!()
                                                 };
-                                                let WasmValue::I32(ptr) = args.next().unwrap()
+                                                let WasmValue::I32(len) = args.next().unwrap()
                                                 else {
                                                     unreachable!()
                                                 };
@@ -343,7 +365,13 @@ fn main() {
                                             }
                                         })
                                         .collect::<Vec<_>>();
-                                    tx.send(args).unwrap();
+                                    let message = Message {
+                                        object_id,
+                                        opcode,
+                                        kind,
+                                        args,
+                                    };
+                                    tx.send(message).unwrap();
                                     Ok(Vec::new())
                                 }
                             },
@@ -458,54 +486,111 @@ fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: Borrowed
     let to_send: Vec<_> = fds.iter().map(|fd| fd.as_fd()).collect();
     send_cmsg.push(SendAncillaryMessage::ScmRights(to_send.as_slice()));
 
-    while let Some(mut message) = parse_message(state, &bytes[..], kind) {
+    while let Some(message) = parse_message(state, &bytes[..], kind) {
         let (mut to_send, rest) = bytes.split_at(message.size());
 
-        if let Some(interface) = state
+        if let Some(callback) = state
             .objects
             .find(message.object_id)
             .map(|o| o.interface.known())
+            .and_then(|interface| {
+                let name = match kind {
+                    MessageKind::Request => &interface.requests[message.opcode as usize].name,
+                    MessageKind::Event => &interface.events[message.opcode as usize].name,
+                };
+
+                state
+                    .module
+                    .exported_func_untyped(&state.store, &format!("{}_{}", &interface.name, name))
+                    .ok()
+            })
         {
-            let name = match kind {
-                MessageKind::Request => &interface.requests[message.opcode as usize].name,
-                MessageKind::Event => &interface.events[message.opcode as usize].name,
-            };
+            let args: Vec<WasmValue> = iter::once(WasmValue::I32(message.object_id as i32))
+                .chain(
+                    message
+                        .args
+                        .iter()
+                        .flat_map(|arg| match arg {
+                            Arg::Uint(uint) => [Some(WasmValue::I32(*uint as i32)), None],
+                            Arg::Int(int) => [Some(WasmValue::I32(*int)), None],
+                            Arg::Fixed(fixed) => [Some(WasmValue::F64(*fixed)), None],
+                            Arg::String(string) => {
+                                let mut memory =
+                                    state.module.memory_mut(&mut state.store, 0).unwrap();
+                                let ptr = 0x10000;
+                                let len = string.len();
+                                memory.store(ptr, len, string.as_bytes()).unwrap();
+                                [
+                                    Some(WasmValue::I32(ptr as i32)),
+                                    Some(WasmValue::I32(len as i32)),
+                                ]
+                            }
+                            Arg::Object(object_id) => {
+                                [Some(WasmValue::I32(*object_id as i32)), None]
+                            }
+                            Arg::NewId {
+                                object_id,
+                                interface: None,
+                            } => [Some(WasmValue::I32(*object_id as i32)), None],
+                            Arg::NewId {
+                                object_id: _,
+                                interface: Some((_name, _version)),
+                            } => todo!(),
+                            Arg::Array(items) => {
+                                let mut memory =
+                                    state.module.memory_mut(&mut state.store, 0).unwrap();
+                                let ptr = 0x10000;
+                                let len = items.len();
+                                memory.store(ptr, len, items.as_slice()).unwrap();
+                                [
+                                    Some(WasmValue::I32(ptr as i32)),
+                                    Some(WasmValue::I32(len as i32)),
+                                ]
+                            }
+                            Arg::Fd(fd) => [Some(WasmValue::I32(*fd)), None],
+                        })
+                        .flatten(),
+                )
+                .collect();
 
-            if let Ok(callback) = state
-                .module
-                .exported_func_untyped(&state.store, &format!("{}_{}", &interface.name, name))
-            {
-                let args = message
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        Arg::Uint(uint) => WasmValue::I32(*uint as i32),
-                        _ => todo!(),
-                    })
-                    .collect::<Vec<_>>();
-
-                let _ = callback.call(&mut state.store, &args).unwrap();
-                let args = state.rx.recv().unwrap();
-                message.args = args;
-                to_send = &message.to_bytes().leak()[..];
+            let _ = callback.call(&mut state.store, &args).unwrap();
+            for message in state.rx.try_iter() {
+                let mut bytes = &message.to_bytes()[..];
+                while bytes.len() > 0 {
+                    match sendmsg(
+                        to.as_fd(),
+                        &[IoSlice::new(&bytes)],
+                        &mut send_cmsg,
+                        SendFlags::empty(),
+                    ) {
+                        Ok(0) => {
+                            std::process::exit(0);
+                        }
+                        Ok(sent) => {
+                            bytes = &bytes[sent..];
+                            send_cmsg.clear();
+                        }
+                        Err(e) => panic!("sendmsg error: {e}"),
+                    }
+                }
             }
-        }
-
-        while to_send.len() > 0 {
-            match sendmsg(
-                to.as_fd(),
-                &[IoSlice::new(&to_send)],
-                &mut send_cmsg,
-                SendFlags::empty(),
-            ) {
-                Ok(0) => {
-                    std::process::exit(0);
+        } else {
+            while to_send.len() > 0 {
+                match sendmsg(
+                    to.as_fd(),
+                    &[IoSlice::new(&to_send)],
+                    &mut send_cmsg,
+                    SendFlags::empty(),
+                ) {
+                    Ok(0) => {
+                        std::process::exit(0);
+                    }
+                    Ok(sent) => {
+                        to_send = &to_send[sent..];
+                        send_cmsg.clear();
+                    }
+                    Err(e) => panic!("sendmsg error: {e}"),
                 }
-                Ok(sent) => {
-                    to_send = &to_send[sent..];
-                    send_cmsg.clear();
-                }
-                Err(e) => panic!("sendmsg error: {e}"),
             }
         }
         bytes = rest;
@@ -609,7 +694,7 @@ fn parse_message(state: &mut State, mut bytes: &[u8], kind: MessageKind) -> Opti
         kind,
         args,
     };
-    println!("{}", message.to_string(&state.objects));
+    eprintln!("{}", message.to_string(&state.objects));
     assert_eq!(message.size() as u16, length);
     Some(message)
 }
@@ -618,7 +703,7 @@ struct State {
     objects: ObjectMap,
     store: Store,
     module: ModuleInstance,
-    rx: Receiver<Vec<Arg>>,
+    rx: Receiver<Message>,
 }
 
 #[derive(Debug, Clone)]
