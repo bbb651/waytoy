@@ -14,7 +14,7 @@ use serde_derive::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Protocol {
-    #[serde(rename(deserialize = "@name"))]
+    #[serde(rename = "@name")]
     pub name: String,
     #[serde(default, rename(deserialize = "interface"))]
     pub interfaces: Vec<Interface>,
@@ -22,37 +22,37 @@ pub struct Protocol {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Interface {
-    #[serde(rename(deserialize = "@name"))]
+    #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename(deserialize = "@version"))]
+    #[serde(rename = "@version")]
     pub version: u32,
-    #[serde(default, rename(deserialize = "request"))]
+    #[serde(default, rename = "request")]
     pub requests: Vec<Message>,
-    #[serde(default, rename(deserialize = "event"))]
+    #[serde(default, rename = "event")]
     pub events: Vec<Message>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Message {
-    #[serde(rename(deserialize = "@name"))]
+    #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename(deserialize = "@type"))]
-    pub typ: Option<MessageType>,
-    #[serde(default, rename(deserialize = "arg"))]
+    #[serde(rename = "@type")]
+    pub ty: Option<MessageType>,
+    #[serde(default, rename = "arg")]
     pub args: Vec<Arg>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Arg {
-    #[serde(rename(deserialize = "@name"))]
+    #[serde(rename = "@name")]
     pub name: String,
-    #[serde(rename(deserialize = "@type"))]
-    pub typ: Type,
-    #[serde(rename(deserialize = "@interface"))]
+    #[serde(rename = "@type")]
+    pub ty: Type,
+    #[serde(rename = "@interface")]
     pub interface: Option<String>,
-    #[serde(default, rename(deserialize = "@allow-null"))]
+    #[serde(default, rename = "@allow-null")]
     pub allow_null: bool,
-    #[serde(rename(deserialize = "@enum"))]
+    #[serde(rename = "@enum")]
     pub enu: Option<String>,
 }
 
@@ -85,7 +85,6 @@ pub static PROTOCOLS: LazyLock<HashMap<String, Protocol>> = LazyLock::new(|| {
     );
     let mut protocols = HashMap::new();
     let mut read_protocol = |path: &Path| -> Result<(), String> {
-        dbg!(path);
         match protocols.entry(
             path.file_stem()
                 .ok_or("cannot get protocol name")?
@@ -120,13 +119,19 @@ pub static PROTOCOLS: LazyLock<HashMap<String, Protocol>> = LazyLock::new(|| {
                 continue;
             };
             let namespace = namespace.file_name();
-            namespace_dir.push(namespace);
+            namespace_dir.push(&namespace);
             let mut protocol_dir = namespace_dir.clone();
             for protocol in namespace_dir.read_dir().into_iter().flatten() {
                 let Ok(protocol) = protocol else {
                     continue;
                 };
                 let protocol = protocol.file_name();
+                // HACK: Ignore old xdg-shell protocol that overwrite interfaces
+                if namespace.to_string_lossy() == "unstable"
+                    && protocol.to_string_lossy().starts_with("xdg-shell")
+                {
+                    continue;
+                }
                 protocol_dir.push(protocol);
                 let mut version_dir = protocol_dir.clone();
                 for version in protocol_dir.read_dir().into_iter().flatten() {
@@ -142,8 +147,20 @@ pub static PROTOCOLS: LazyLock<HashMap<String, Protocol>> = LazyLock::new(|| {
             }
             namespace_dir.pop();
         }
+        dir.pop();
+        dir.push("wayland-wlroots");
+        let mut protocol_dir = dir.clone();
+        for protocol in dir.read_dir().into_iter().flatten() {
+            let Ok(protocol) = protocol else {
+                continue;
+            };
+            let protocol = protocol.file_name();
+            protocol_dir.push(protocol);
+            let _ = read_protocol(&protocol_dir);
+            protocol_dir.pop();
+        }
+        dir.pop();
     }
-    dbg!(protocols.len());
     protocols
 });
 
