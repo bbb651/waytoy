@@ -254,12 +254,16 @@ fn main() {
                             .args
                             .iter()
                             .flat_map(|arg| match arg.ty {
-                                Type::Int => [ValType::I64].as_slice(),
+                                Type::Int => [ValType::I32].as_slice(),
                                 Type::Uint => [ValType::I32].as_slice(),
-                                Type::Fixed => [ValType::I32].as_slice(),
+                                Type::Fixed => [ValType::F64].as_slice(),
                                 Type::String => [ValType::I32, ValType::I32].as_slice(),
                                 Type::Object => [ValType::I32].as_slice(),
-                                Type::NewId => [ValType::I32].as_slice(),
+                                Type::NewId if arg.interface.is_some() => [ValType::I32].as_slice(),
+                                Type::NewId => {
+                                    [ValType::I32, ValType::I32, ValType::I32, ValType::I32]
+                                        .as_slice()
+                                }
                                 Type::Array => [ValType::I32, ValType::I32].as_slice(),
                                 Type::Fd => [ValType::I32].as_slice(),
                             })
@@ -335,11 +339,40 @@ fn main() {
                                                 Arg::Object(*object as u32)
                                             }
                                             Type::NewId => {
-                                                let WasmValue::I32(new_id) = args.next().unwrap()
+                                                let interface = if arg.interface.is_none() {
+                                                    let WasmValue::I32(ptr) = args.next().unwrap()
+                                                    else {
+                                                        unreachable!()
+                                                    };
+                                                    let WasmValue::I32(len) = args.next().unwrap()
+                                                    else {
+                                                        unreachable!()
+                                                    };
+                                                    let mem =
+                                                        ctx.exported_memory("memory").unwrap();
+                                                    let interface = mem
+                                                        .load_string(*ptr as usize, *len as usize)
+                                                        .unwrap();
+                                                    let WasmValue::I32(version) =
+                                                        args.next().unwrap()
+                                                    else {
+                                                        unreachable!()
+                                                    };
+                                                    Some((interface, *version as u32))
+                                                } else {
+                                                    None
+                                                };
+                                                let WasmValue::I32(object_id) =
+                                                    args.next().unwrap()
                                                 else {
                                                     unreachable!()
                                                 };
-                                                Arg::Object(*new_id as u32)
+                                                let object_id = *object_id as u32;
+                                                dbg!(&object_id, &interface);
+                                                Arg::NewId {
+                                                    object_id,
+                                                    interface,
+                                                }
                                             }
                                             Type::Array => {
                                                 let WasmValue::I32(ptr) = args.next().unwrap()
@@ -511,9 +544,11 @@ fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: Borrowed
                         .args
                         .iter()
                         .flat_map(|arg| match arg {
-                            Arg::Uint(uint) => [Some(WasmValue::I32(*uint as i32)), None],
-                            Arg::Int(int) => [Some(WasmValue::I32(*int)), None],
-                            Arg::Fixed(fixed) => [Some(WasmValue::F64(*fixed)), None],
+                            Arg::Uint(uint) => {
+                                [Some(WasmValue::I32(*uint as i32)), None, None, None]
+                            }
+                            Arg::Int(int) => [Some(WasmValue::I32(*int)), None, None, None],
+                            Arg::Fixed(fixed) => [Some(WasmValue::F64(*fixed)), None, None, None],
                             Arg::String(string) => {
                                 let mut memory =
                                     state.module.memory_mut(&mut state.store, 0).unwrap();
@@ -523,19 +558,33 @@ fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: Borrowed
                                 [
                                     Some(WasmValue::I32(ptr as i32)),
                                     Some(WasmValue::I32(len as i32)),
+                                    None,
+                                    None,
                                 ]
                             }
                             Arg::Object(object_id) => {
-                                [Some(WasmValue::I32(*object_id as i32)), None]
+                                [Some(WasmValue::I32(*object_id as i32)), None, None, None]
                             }
                             Arg::NewId {
                                 object_id,
                                 interface: None,
-                            } => [Some(WasmValue::I32(*object_id as i32)), None],
+                            } => [Some(WasmValue::I32(*object_id as i32)), None, None, None],
                             Arg::NewId {
-                                object_id: _,
-                                interface: Some((_name, _version)),
-                            } => todo!(),
+                                object_id,
+                                interface: Some((name, version)),
+                            } => {
+                                let mut memory =
+                                    state.module.memory_mut(&mut state.store, 0).unwrap();
+                                let ptr = 0x10000;
+                                let len = name.len();
+                                memory.store(ptr, len, name.as_bytes()).unwrap();
+                                [
+                                    Some(WasmValue::I32(ptr as i32)),
+                                    Some(WasmValue::I32(len as i32)),
+                                    Some(WasmValue::I32(*version as i32)),
+                                    Some(WasmValue::I32(*object_id as i32)),
+                                ]
+                            }
                             Arg::Array(items) => {
                                 let mut memory =
                                     state.module.memory_mut(&mut state.store, 0).unwrap();
@@ -545,9 +594,11 @@ fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: Borrowed
                                 [
                                     Some(WasmValue::I32(ptr as i32)),
                                     Some(WasmValue::I32(len as i32)),
+                                    None,
+                                    None,
                                 ]
                             }
-                            Arg::Fd(fd) => [Some(WasmValue::I32(*fd)), None],
+                            Arg::Fd(fd) => [Some(WasmValue::I32(*fd)), None, None, None],
                         })
                         .flatten(),
                 )
@@ -555,6 +606,7 @@ fn transfer(state: &mut State, kind: MessageKind, from: BorrowedFd, to: Borrowed
 
             let _ = callback.call(&mut state.store, &args).unwrap();
             for message in state.rx.try_iter() {
+                // dbg!(&message);
                 let mut bytes = &message.to_bytes()[..];
                 while bytes.len() > 0 {
                     match sendmsg(
